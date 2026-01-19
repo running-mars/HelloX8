@@ -8,7 +8,7 @@ gains in CIRCLE_CONFIG to suit your JSBSim aircraft definition.
 import argparse
 import math
 from dataclasses import dataclass
-from typing import Iterable, Tuple
+from typing import Tuple
 
 import jsbsim
 
@@ -20,11 +20,22 @@ EARTH_RADIUS_M = 6_378_137.0
 def wrap_angle(angle: float) -> float:
 	"""Wrap angle to [-pi, pi]."""
 
-	while angle > math.pi:
-		angle -= 2.0 * math.pi
-	while angle < -math.pi:
-		angle += 2.0 * math.pi
-	return angle
+	return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def clamp(value: float, lower: float, upper: float) -> float:
+	"""Clamp value into [lower, upper]."""
+
+	return max(lower, min(value, upper))
+
+
+def safe_cos(angle: float, eps: float = 1e-6) -> float:
+	"""Return cos(angle) with a floor on magnitude to avoid divide-by-zero."""
+
+	value = math.cos(angle)
+	if abs(value) < eps:
+		value = math.copysign(eps, value if value != 0.0 else 1.0)
+	return value
 
 
 class PIDController:
@@ -44,12 +55,11 @@ class PIDController:
 		self.prev_error = 0.0
 
 	def update(self, error: float, dt: float) -> float:
-		self.integral += error * dt
-		self.integral = max(-self.integ_limit, min(self.integral, self.integ_limit))
+		self.integral = clamp(self.integral + error * dt, -self.integ_limit, self.integ_limit)
 		derivative = (error - self.prev_error) / dt if dt > 0.0 else 0.0
 		self.prev_error = error
 		output = self.kp * error + self.ki * self.integral + self.kd * derivative
-		return max(-self.limit, min(output, self.limit))
+		return clamp(output, -self.limit, self.limit)
 
 
 @dataclass
@@ -104,21 +114,14 @@ class CircleFlightController:
 	def _setup_initial_conditions(self) -> None:
 		cfg = self.config
 		north, east, down = cfg.initial_position_ned
-		cos_ref = math.cos(self.reference_lat_rad)
-		if abs(cos_ref) < 1e-6:
-			cos_ref = math.copysign(1e-6, cos_ref if cos_ref != 0.0 else 1.0)
-		lat = self.reference_lat_rad + north / EARTH_RADIUS_M
-		lon = self.reference_lon_rad + east / (EARTH_RADIUS_M * cos_ref)
+		lat, lon = self._ned_to_geodetic(north, east)
 		altitude_m = -down
 		yaw_deg, pitch_deg, roll_deg = cfg.initial_attitude_deg
-		yaw_rad = math.radians(yaw_deg)
-		pitch_rad = math.radians(pitch_deg)
-		roll_rad = math.radians(roll_deg)
 		self.fdm['ic/h-sl-m'] = altitude_m
 		self.fdm['ic/vc-kts'] = cfg.target_v_ms * 1.94384
-		self.fdm['ic/psi-true-rad'] = yaw_rad
-		self.fdm['ic/theta-rad'] = pitch_rad
-		self.fdm['ic/phi-rad'] = roll_rad
+		self.fdm['ic/psi-true-rad'] = math.radians(yaw_deg)
+		self.fdm['ic/theta-rad'] = math.radians(pitch_deg)
+		self.fdm['ic/phi-rad'] = math.radians(roll_deg)
 		self.fdm['ic/latitude-deg'] = math.degrees(lat)
 		self.fdm['ic/longitude-deg'] = math.degrees(lon)
 		self.fdm['ic/heading-true-deg'] = yaw_deg
@@ -127,19 +130,24 @@ class CircleFlightController:
 
 	def _init_autopilot(self) -> None:
 		cfg = self.config
+		self.max_bank_rad = math.radians(cfg.bank_limit_deg)
+		self.max_pitch_rad = math.radians(cfg.pitch_limit_deg)
 		self.roll_pid = PIDController(kp=1.0, ki=0.0, kd=0.8, limit=1.0)
-		self.altitude_pid = PIDController(kp=0.02, ki=0.002, kd=0.04, limit=math.radians(cfg.pitch_limit_deg))
+		self.altitude_pid = PIDController(kp=0.02, ki=0.002, kd=0.04, limit=self.max_pitch_rad)
 		self.pitch_pid = PIDController(kp=2.5, ki=0.1, kd=0.3, limit=0.6)
 		self.speed_pid = PIDController(kp=0.1, ki=0.05, kd=0.02, limit=1.0)
 
 	def _compute_circle_center(self) -> None:
 		north_c, east_c, down_c = self.config.circle_center_ned
-		cos_ref = math.cos(self.reference_lat_rad)
-		if abs(cos_ref) < 1e-6:
-			cos_ref = math.copysign(1e-6, cos_ref if cos_ref != 0.0 else 1.0)
 		self.center_lat = self.reference_lat_rad + north_c / EARTH_RADIUS_M
-		self.center_lon = self.reference_lon_rad + east_c / (EARTH_RADIUS_M * cos_ref)
+		self.center_lon = self.reference_lon_rad + east_c / (EARTH_RADIUS_M * safe_cos(self.reference_lat_rad))
 		self.center_alt_m = -down_c
+		self.center_lat_cos = safe_cos(self.center_lat)
+
+	def _ned_to_geodetic(self, north: float, east: float) -> Tuple[float, float]:
+		lat = self.reference_lat_rad + north / EARTH_RADIUS_M
+		lon = self.reference_lon_rad + east / (EARTH_RADIUS_M * safe_cos(self.reference_lat_rad))
+		return lat, lon
 
 	def _render_plot(self) -> None:
 		if not self.config.plot_enabled:
@@ -173,10 +181,7 @@ class CircleFlightController:
 	def _get_state(self) -> Tuple[float, float, float, float, float, float, float]:
 		lat, lon, altitude = self._get_lat_lon_alt()
 		rel_north = (lat - self.center_lat) * EARTH_RADIUS_M
-		cos_lat = math.cos(self.center_lat)
-		if abs(cos_lat) < 1e-6:
-			cos_lat = math.copysign(1e-6, cos_lat if cos_lat != 0.0 else 1.0)
-		rel_east = (lon - self.center_lon) * EARTH_RADIUS_M * cos_lat
+		rel_east = (lon - self.center_lon) * EARTH_RADIUS_M * self.center_lat_cos
 		heading = self.fdm["attitude/psi-rad"]
 		roll = self.fdm["attitude/phi-rad"]
 		pitch = self.fdm["attitude/theta-rad"]
@@ -204,32 +209,29 @@ class CircleFlightController:
 		if self.in_orbit:
 			heading_error = wrap_angle(orbit_heading - heading)
 			base_bank = math.atan2(speed * speed, G_ACCEL * cfg.radius_m) * cfg.circle_direction
-			bank_adjust = cfg.orbit_gain * heading_error
-			target_bank = base_bank + bank_adjust
+			target_bank = base_bank + cfg.orbit_gain * heading_error
 		else:
 			heading_error = wrap_angle(self.initial_heading - heading)
 			target_bank = cfg.straight_heading_gain * heading_error
 
-		target_bank = max(-math.radians(cfg.bank_limit_deg), min(target_bank, math.radians(cfg.bank_limit_deg)))
+		target_bank = clamp(target_bank, -self.max_bank_rad, self.max_bank_rad)
 		bank_error = target_bank - roll
 		aileron = self.roll_pid.update(bank_error, dt)
 
-		altitude_error = cfg.target_alt_m - altitude
-		target_pitch = self.altitude_pid.update(altitude_error, dt)
-		target_pitch = max(-math.radians(cfg.pitch_limit_deg), min(target_pitch, math.radians(cfg.pitch_limit_deg)))
+		target_pitch = self.altitude_pid.update(cfg.target_alt_m - altitude, dt)
+		target_pitch = clamp(target_pitch, -self.max_pitch_rad, self.max_pitch_rad)
 		pitch_error = target_pitch - pitch
 		elevator = -self.pitch_pid.update(pitch_error, dt)
 
-		speed_error = cfg.target_v_ms - speed
-		throttle = self.speed_pid.update(speed_error, dt)
-		throttle = max(0.0, min(throttle, 1.0))
+		throttle = self.speed_pid.update(cfg.target_v_ms - speed, dt)
+		throttle = clamp(throttle, 0.0, 1.0)
 
 		self._apply_controls(aileron, elevator, throttle)
 
 	def run(self) -> None:
 		duration = self.config.duration_s
 		dt = self.config.time_step
-		step_print = 1.0
+		report_interval = 1.0
 		next_report = 0.0
 		sim_time = 0.0
 		while sim_time < duration and self.fdm.run():
@@ -239,13 +241,13 @@ class CircleFlightController:
 			self.track_east.append(rel_east)
 			self.track_north.append(rel_north)
 			if sim_time >= next_report:
-				radius_err = abs(math.hypot(rel_north, rel_east) - self.config.radius_m)
+				radius_error = abs(math.hypot(rel_north, rel_east) - self.config.radius_m)
 				print(
 					f"t={sim_time:5.1f}s alt={altitude:4.1f}m v={speed:4.1f}m/s "
 					f"hdg={math.degrees(heading):4.1f}deg roll={math.degrees(roll):2.1f}deg "
-					f"radius_err={radius_err:3.1f}m"
+					f"radius_err={radius_error:3.1f}m"
 				)
-				next_report += step_print
+				next_report += report_interval
 		self._render_plot()
 
 
