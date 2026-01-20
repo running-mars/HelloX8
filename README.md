@@ -1,5 +1,8 @@
 # HelloX8
 
+## Introduction
+This project is developed with Ubuntu 20.04 LTS. There may be some problems with other OS.
+
 ## Install JSBSim with Python
 ```bash
 conda create --name sim python=3.8
